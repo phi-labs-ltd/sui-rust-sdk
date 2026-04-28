@@ -12,6 +12,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use wiremock::http::HeaderMap;
 
 use crate::error::Error;
 use crate::error::GraphQLError;
@@ -22,6 +23,7 @@ use crate::response::Response;
 pub struct Client {
     endpoint: Url,
     http: reqwest::Client,
+    headers: reqwest::header::HeaderMap,
 }
 
 impl Client {
@@ -48,7 +50,31 @@ impl Client {
         Ok(Self {
             endpoint,
             http: reqwest::Client::new(),
+            headers: reqwest::header::HeaderMap::new(),
         })
+    }
+
+    /// Attach a set of headers to be sent with every GraphQL request.
+    ///
+    /// Replaces any previously-configured headers. Useful for API keys,
+    /// authorization tokens, tracing headers, and similar.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sui_graphql::Client;
+    ///
+    /// let mut headers = reqwest::header::HeaderMap::new();
+    /// headers.insert(
+    ///     reqwest::header::AUTHORIZATION,
+    ///     "Bearer my-token".parse().unwrap(),
+    /// );
+    ///
+    /// let client = Client::new(Client::MAINNET).unwrap().with_headers(headers);
+    /// ```
+    pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
+        self.headers = headers;
+        self
     }
 
     /// Execute a GraphQL query and return the response.
@@ -108,14 +134,12 @@ impl Client {
 
         let request = GraphQLRequest { query, variables };
 
-        let raw: GraphQLResponse<T> = self
-            .http
-            .post(self.endpoint.clone())
-            .json(&request)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let mut req = self.http.post(self.endpoint.clone()).json(&request);
+        if !self.headers.is_empty() {
+            req = req.headers(self.headers.clone());
+        }
+
+        let raw: GraphQLResponse<T> = req.send().await?.json().await?;
 
         Ok(Response::new(raw.data, raw.errors.unwrap_or_default()))
     }
