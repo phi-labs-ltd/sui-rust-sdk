@@ -12,7 +12,6 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use wiremock::http::HeaderMap;
 
 use crate::error::Error;
 use crate::error::GraphQLError;
