@@ -10,10 +10,6 @@ use crate::error::GraphQLError;
 /// - Success: `data` is present, `errors` is empty
 /// - Partial success: `data` is present AND `errors` is non-empty
 /// - Failure: `data` is None, `errors` is non-empty
-///
-/// None of the three implies a particular HTTP status. A server may report query-level errors
-/// under a non-success status while still returning a usable response, so [`Response::status`]
-/// stays available alongside the data.
 #[derive(Debug)]
 pub struct Response<T> {
     status: StatusCode,
@@ -31,11 +27,8 @@ impl<T> Response<T> {
         }
     }
 
-    /// HTTP status the response arrived under.
-    ///
-    /// Usually a success status. A GraphQL server that reports query-level errors with a
-    /// non-success status produces a response that is still worth reading, and this is the only
-    /// place that status survives.
+    /// HTTP status the response arrived under. Not always a success status: a server may report
+    /// query-level errors with a 4xx and still return a readable response.
     pub fn status(&self) -> StatusCode {
         self.status
     }

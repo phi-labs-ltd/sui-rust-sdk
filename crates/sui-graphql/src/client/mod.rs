@@ -9,7 +9,6 @@ pub(crate) mod objects;
 pub(crate) mod transactions;
 
 use reqwest::Url;
-use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
@@ -154,7 +153,15 @@ impl Client {
 
     /// Execute a GraphQL query and return the response.
     ///
-    /// The response contains both data and any errors (GraphQL supports partial success).
+    /// The response contains both data and any errors (GraphQL supports partial success), and
+    /// carries the HTTP status it arrived under via [`Response::status`].
+    ///
+    /// # Errors
+    ///
+    /// A non-success HTTP status whose body is still a GraphQL response is returned as `Ok`, so
+    /// query-level errors reported under a 4xx reach the caller intact. A non-success status with
+    /// any other body — a gateway's HTML page, an unrelated JSON error — returns
+    /// [`Error::HttpStatus`] with the status and the start of the body.
     ///
     /// # Example
     ///
@@ -229,57 +236,47 @@ impl Client {
             ));
         }
 
-        // A non-success status carries a GraphQL response only when the body holds GraphQL
-        // content. Anything else came from an intermediary rather than from the GraphQL server,
-        // including JSON that deserializes into an empty response, which would otherwise be
-        // indistinguishable from a query that returned no data.
-        let content_type = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        // Under a non-success status, only a non-empty `data` object or a non-empty `errors` list
+        // marks the body as the GraphQL server's own. Shapes that merely deserialize — an
+        // intermediary's `{"error":...}`, or a bare `{}` — would pass for a query that returned
+        // nothing, since every generated response type has all-optional fields.
         let body = resp.bytes().await?;
-        match serde_json::from_slice::<GraphQLResponse<T>>(&body) {
-            Ok(raw) if raw.data.is_some() || raw.errors.is_some() => Ok(Response::new(
-                status,
-                raw.data,
-                raw.errors.unwrap_or_default(),
-            )),
+        match serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body) {
+            Ok(raw)
+                if raw
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|data| !data.is_empty())
+                    || raw.errors.as_ref().is_some_and(|errors| !errors.is_empty()) =>
+            {
+                let data = raw
+                    .data
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| Error::Deserialization(format!("graphql data: {e}")))?;
+                Ok(Response::new(status, data, raw.errors.unwrap_or_default()))
+            }
             _ => Err(Error::HttpStatus {
                 status,
-                body: body_snippet(content_type.as_deref(), &body),
+                body: body_snippet(&body),
             }),
         }
     }
 }
 
-/// How much of a body that is not JSON survives into an error message.
-const BODY_SNIPPET_LIMIT: usize = 500;
+/// How much of a response body survives into an error message.
+const BODY_SNIPPET_LIMIT: usize = 512;
 
-/// A response body, rendered for an error message.
-///
-/// A JSON body is the endpoint's own structured error report and is kept whole, so nothing the
-/// caller needs is cut off mid-field. Anything else -- an intermediary's HTML error page, most
-/// often -- is truncated to keep it out of a log line.
-fn body_snippet(content_type: Option<&str>, body: &[u8]) -> String {
+/// The start of a response body, short enough to keep an error page out of a log line.
+fn body_snippet(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
-    if content_type.is_some_and(is_json) {
-        return text.into_owned();
+    let mut chars = text.chars();
+    let mut snippet: String = chars.by_ref().take(BODY_SNIPPET_LIMIT).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
     }
-    text.chars().take(BODY_SNIPPET_LIMIT).collect()
-}
-
-/// Whether a `Content-Type` names a JSON media type, ignoring parameters such as `; charset`.
-fn is_json(content_type: &str) -> bool {
-    let mime = content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    // `+json` covers the structured suffix forms, `application/graphql-response+json` above all.
-    mime == "application/json" || mime.ends_with("+json")
+    snippet
 }
 
 #[cfg(test)]
@@ -316,7 +313,7 @@ mod tests {
         chain: String,
     }
 
-    /// Answer a single query with `template` and hand back whatever the client made of it.
+    // Answer a single query with `template` and hand back whatever the client made of it.
     async fn query_against(template: ResponseTemplate) -> Result<Response<Chain>, Error> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -507,8 +504,6 @@ mod tests {
         }
     }
 
-    /// An unrelated JSON body deserializes into an empty `GraphQLResponse`, so without the status
-    /// check it is indistinguishable from a query that returned no data.
     #[tokio::test]
     async fn unrelated_json_reports_status() {
         let template = ResponseTemplate::new(401)
@@ -531,8 +526,6 @@ mod tests {
         }
     }
 
-    /// GraphQL servers may report query-level errors with a non-success status. Those are real
-    /// GraphQL responses and stay available to the caller.
     #[tokio::test]
     async fn graphql_errors_survive_non_success_status() {
         let template = ResponseTemplate::new(400).set_body_string(
@@ -545,18 +538,13 @@ mod tests {
             response.errors()[0].message(),
             "Unknown field \"foo\" on type \"Query\"."
         );
-        // The status is the only trace left that this was a rejected request rather than a query
-        // that legitimately resolved to errors, so it has to survive onto the response.
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
-    /// Partial success -- data and errors together -- under a non-success status keeps all three
-    /// pieces: the data stays usable, the errors stay structured, the status stays visible.
     #[tokio::test]
     async fn partial_success_under_non_success_status_keeps_everything() {
-        let template = ResponseTemplate::new(500).set_body_raw(
+        let template = ResponseTemplate::new(500).set_body_string(
             r#"{"data":{"chainIdentifier":"test"},"errors":[{"message":"resolver failed","extensions":{"code":"INTERNAL_ERROR"}}]}"#,
-            "application/graphql-response+json",
         );
 
         let response = query_against(template).await.unwrap();
@@ -569,67 +557,44 @@ mod tests {
         );
     }
 
-    /// An intermediary's error page can run to any length, so it is cut down to a size that fits
-    /// in a log line.
+    // Shapes that deserialize but say nothing: every generated response type has all-optional
+    // fields, so without the shape check these pass for a query that returned no data.
     #[tokio::test]
-    async fn oversized_html_body_is_truncated() {
+    async fn json_without_graphql_content_reports_status() {
+        for body in [
+            r#"{"data":"oops"}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{},"message":"rate limited"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"data":null}"#,
+            "{}",
+        ] {
+            let template = ResponseTemplate::new(500).set_body_string(body);
+
+            match query_against(template).await {
+                Err(Error::HttpStatus { status, .. }) => {
+                    assert_eq!(status, 500, "body: {body}");
+                }
+                other => panic!("expected HttpStatus for {body}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_truncated() {
         let page = format!("<html>{}</html>", "unavailable ".repeat(200));
-        assert!(page.chars().count() > BODY_SNIPPET_LIMIT);
-        let template = ResponseTemplate::new(503).set_body_raw(page, "text/html; charset=utf-8");
+        let template = ResponseTemplate::new(503).set_body_string(page);
 
         match query_against(template).await {
             Err(Error::HttpStatus { body, .. }) => {
-                assert_eq!(body.chars().count(), BODY_SNIPPET_LIMIT);
+                assert_eq!(body.chars().count(), BODY_SNIPPET_LIMIT + 1);
+                assert!(body.ends_with('…'), "body: {body}");
             }
             other => panic!("expected HttpStatus, got: {other:?}"),
         }
     }
 
-    /// A JSON body is the endpoint's own error report. Truncating it would cut a field in half,
-    /// so it survives whole however long it is.
-    #[tokio::test]
-    async fn oversized_json_body_is_not_truncated() {
-        let payload = format!(
-            r#"{{"error":"UNAUTHORIZED","detail":"{}"}}"#,
-            "x".repeat(800)
-        );
-        let template = ResponseTemplate::new(401).set_body_raw(payload.clone(), "application/json");
-
-        match query_against(template).await {
-            Err(Error::HttpStatus { body, .. }) => assert_eq!(body, payload),
-            other => panic!("expected HttpStatus, got: {other:?}"),
-        }
-    }
-
-    /// The GraphQL-over-HTTP media type is JSON too, even though its name is not `application/
-    /// json`. A body under it that is not a GraphQL response still reaches the caller whole.
-    #[tokio::test]
-    async fn graphql_media_type_body_is_not_truncated() {
-        let payload = format!(r#"{{"detail":"{}"}}"#, "y".repeat(800));
-        let template = ResponseTemplate::new(400)
-            .set_body_raw(payload.clone(), "application/graphql-response+json");
-
-        match query_against(template).await {
-            Err(Error::HttpStatus { body, .. }) => assert_eq!(body, payload),
-            other => panic!("expected HttpStatus, got: {other:?}"),
-        }
-    }
-
-    /// Without a `Content-Type` there is nothing to say the body is short or structured, so it is
-    /// treated as the unbounded case.
-    #[tokio::test]
-    async fn body_without_content_type_is_truncated() {
-        let template = ResponseTemplate::new(502).set_body_bytes("z".repeat(900).into_bytes());
-
-        match query_against(template).await {
-            Err(Error::HttpStatus { body, .. }) => {
-                assert_eq!(body.chars().count(), BODY_SNIPPET_LIMIT);
-            }
-            other => panic!("expected HttpStatus, got: {other:?}"),
-        }
-    }
-
-    /// Success responses are decoded exactly as before, including how they fail.
+    // Success responses are decoded exactly as before, including how they fail.
     #[tokio::test]
     async fn success_with_undecodable_body_stays_a_decode_error() {
         let template = ResponseTemplate::new(200).set_body_string("not json at all");

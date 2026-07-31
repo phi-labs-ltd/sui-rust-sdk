@@ -20,14 +20,11 @@ pub enum Error {
     /// The endpoint answered with a non-success HTTP status and a body that is not a GraphQL
     /// response. Proxies, load balancers and API gateways in front of an endpoint report their
     /// own failures this way, in HTML, plain text or an unrelated JSON shape.
-    ///
-    /// A JSON body is kept whole, since it is the endpoint's own structured error report.
-    /// Any other body is truncated to 500 characters.
     #[error("HTTP status {status}: {body}")]
     HttpStatus {
         /// HTTP status of the response.
         status: reqwest::StatusCode,
-        /// The response body, possibly truncated.
+        /// Start of the response body, ending in `…` if it was truncated.
         body: String,
     },
 
