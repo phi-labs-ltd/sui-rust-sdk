@@ -227,41 +227,44 @@ impl Client {
         let resp = req.send().await?;
         let status = resp.status();
 
-        if status.is_success() {
-            let raw: GraphQLResponse<T> = resp.json().await?;
-            return Ok(Response::new(
-                status,
-                raw.data,
-                raw.errors.unwrap_or_default(),
-            ));
+        if !status.is_success() {
+            // A GraphQL server may still answer here, so the body decides. Only a non-empty
+            // `data` object or a non-empty `errors` list marks it as the server's own: shapes
+            // that merely deserialize — an intermediary's `{"error":...}`, or a bare `{}` —
+            // would pass for a query that returned nothing, since every generated response type
+            // has all-optional fields.
+            let body = resp.bytes().await?;
+            let graphql = serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body)
+                .ok()
+                .filter(|raw| {
+                    raw.data
+                        .as_ref()
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|data| !data.is_empty())
+                        || raw.errors.as_ref().is_some_and(|errors| !errors.is_empty())
+                });
+
+            let Some(raw) = graphql else {
+                return Err(Error::HttpStatus {
+                    status,
+                    body: body_snippet(&body),
+                });
+            };
+
+            let data = raw
+                .data
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| Error::Deserialization(format!("graphql data: {e}")))?;
+            return Ok(Response::new(status, data, raw.errors.unwrap_or_default()));
         }
 
-        // Under a non-success status, only a non-empty `data` object or a non-empty `errors` list
-        // marks the body as the GraphQL server's own. Shapes that merely deserialize — an
-        // intermediary's `{"error":...}`, or a bare `{}` — would pass for a query that returned
-        // nothing, since every generated response type has all-optional fields.
-        let body = resp.bytes().await?;
-        match serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body) {
-            Ok(raw)
-                if raw
-                    .data
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|data| !data.is_empty())
-                    || raw.errors.as_ref().is_some_and(|errors| !errors.is_empty()) =>
-            {
-                let data = raw
-                    .data
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| Error::Deserialization(format!("graphql data: {e}")))?;
-                Ok(Response::new(status, data, raw.errors.unwrap_or_default()))
-            }
-            _ => Err(Error::HttpStatus {
-                status,
-                body: body_snippet(&body),
-            }),
-        }
+        let raw: GraphQLResponse<T> = resp.json().await?;
+        Ok(Response::new(
+            status,
+            raw.data,
+            raw.errors.unwrap_or_default(),
+        ))
     }
 }
 
