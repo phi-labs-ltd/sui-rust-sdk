@@ -24,6 +24,36 @@ use crate::response::Response;
 /// server's SDK-type allowlist to be tracked verbatim.
 const CLIENT_SDK_TYPE_HEADER: HeaderName = HeaderName::from_static("client-sdk-type");
 
+/// A response body in the shape the GraphQL spec defines.
+#[derive(Deserialize)]
+struct GraphQLResponse<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphQLError>>,
+}
+
+impl GraphQLResponse<serde_json::Value> {
+    /// Whether this body is the GraphQL server's own answer rather than an intermediary's error
+    /// report.
+    ///
+    /// Only a non-empty `data` object or a non-empty `errors` list qualifies. Deserializing
+    /// successfully proves nothing: `data` and `errors` are both optional, so a gateway's
+    /// `{"error":"UNAUTHORIZED"}` or a bare `{}` parses just as well as a real response, and would
+    /// otherwise pass for a query that legitimately returned nothing.
+    fn is_graphql(&self) -> bool {
+        let has_data = self
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|data| !data.is_empty());
+
+        has_data
+            || self
+                .errors
+                .as_ref()
+                .is_some_and(|errors| !errors.is_empty())
+    }
+}
+
 /// GraphQL client for Sui blockchain.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -158,10 +188,14 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// A non-success HTTP status whose body is still a GraphQL response is returned as `Ok`, so
-    /// query-level errors reported under a 4xx reach the caller intact. A non-success status with
-    /// any other body — a gateway's HTML page, an unrelated JSON error — returns
-    /// [`Error::HttpStatus`] with the status and the start of the body.
+    /// - [`Error::GraphQL`] when the server reports errors and no data, whatever the HTTP status.
+    ///   The query never ran, so this is an error rather than an empty result.
+    /// - [`Error::HttpStatus`] when a non-success status carries a body that is not a GraphQL
+    ///   response at all — a gateway's HTML page, an unrelated JSON error, an empty body.
+    /// - [`Error::Request`] for network failures and for bodies that cannot be decoded.
+    ///
+    /// Partial success — data *and* errors — is `Ok`. The errors are on the [`Response`], and
+    /// [`Response::status`] carries the status they arrived under.
     ///
     /// # Example
     ///
@@ -182,11 +216,10 @@ impl Client {
     ///         .query::<MyResponse>("query { chainIdentifier }", serde_json::json!({}))
     ///         .await?;
     ///
-    ///     // Check for partial errors
-    ///     if response.has_errors() {
-    ///         for err in response.errors() {
-    ///             eprintln!("GraphQL error: {}", err.message());
-    ///         }
+    ///     // A total failure would already have returned Err(Error::GraphQL). Errors here mean
+    ///     // some fields resolved and others did not.
+    ///     for err in response.errors() {
+    ///         eprintln!("partial error at {:?}: {}", err.path(), err.message());
     ///     }
     ///
     ///     // Access the data
@@ -208,12 +241,6 @@ impl Client {
             variables: serde_json::Value,
         }
 
-        #[derive(Deserialize)]
-        struct GraphQLResponse<T> {
-            data: Option<T>,
-            errors: Option<Vec<GraphQLError>>,
-        }
-
         let request = GraphQLRequest { query, variables };
 
         let mut headers = self.headers.clone();
@@ -227,59 +254,45 @@ impl Client {
         let resp = req.send().await?;
         let status = resp.status();
 
-        if !status.is_success() {
-            // A GraphQL server may still answer here, so the body decides. Only a non-empty
-            // `data` object or a non-empty `errors` list marks it as the server's own: shapes
-            // that merely deserialize — an intermediary's `{"error":...}`, or a bare `{}` —
-            // would pass for a query that returned nothing, since every generated response type
-            // has all-optional fields.
+        let raw: GraphQLResponse<T> = if status.is_success() {
+            resp.json().await?
+        } else {
+            // A GraphQL server may still answer under a non-success status, so the body decides
+            // whether this is the server talking or something in front of it.
             let body = resp.bytes().await?;
-            let graphql = serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body)
+            let candidate = serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body)
                 .ok()
-                .filter(|raw| {
-                    raw.data
-                        .as_ref()
-                        .and_then(serde_json::Value::as_object)
-                        .is_some_and(|data| !data.is_empty())
-                        || raw.errors.as_ref().is_some_and(|errors| !errors.is_empty())
-                });
+                .filter(GraphQLResponse::is_graphql);
 
-            let Some(raw) = graphql else {
+            let Some(raw) = candidate else {
                 return Err(Error::HttpStatus {
                     status,
-                    body: body_snippet(&body),
+                    body: String::from_utf8_lossy(&body).into_owned(),
                 });
             };
 
-            let data = raw
-                .data
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| Error::Deserialization(format!("graphql data: {e}")))?;
-            return Ok(Response::new(status, data, raw.errors.unwrap_or_default()));
+            GraphQLResponse {
+                data: raw
+                    .data
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| {
+                        Error::Deserialization(format!("graphql data under HTTP {status}: {e}"))
+                    })?,
+                errors: raw.errors,
+            }
+        };
+
+        let errors = raw.errors.unwrap_or_default();
+
+        // No data and a reason why means the query never ran. The HTTP status does not decide
+        // this: a server may report it under `200` with `application/json` or under `400` with
+        // `application/graphql-response+json`, and both mean the same thing.
+        match raw.data {
+            None if !errors.is_empty() => Err(Error::GraphQL { status, errors }),
+            data => Ok(Response::new(status, data, errors)),
         }
-
-        let raw: GraphQLResponse<T> = resp.json().await?;
-        Ok(Response::new(
-            status,
-            raw.data,
-            raw.errors.unwrap_or_default(),
-        ))
     }
-}
-
-/// How much of a response body survives into an error message.
-const BODY_SNIPPET_LIMIT: usize = 512;
-
-/// The start of a response body, short enough to keep an error page out of a log line.
-fn body_snippet(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let mut chars = text.chars();
-    let mut snippet: String = chars.by_ref().take(BODY_SNIPPET_LIMIT).collect();
-    if chars.next().is_some() {
-        snippet.push('…');
-    }
-    snippet
 }
 
 #[cfg(test)]
@@ -529,19 +542,49 @@ mod tests {
         }
     }
 
+    // A rejected query is an error, not an empty result — and the status it arrived under does not
+    // change that. Both of these bodies say the same thing; only the server's content negotiation
+    // differs.
     #[tokio::test]
-    async fn graphql_errors_survive_non_success_status() {
-        let template = ResponseTemplate::new(400).set_body_string(
-            r#"{"errors":[{"message":"Unknown field \"foo\" on type \"Query\"."}]}"#,
-        );
+    async fn rejected_query_is_an_error_whatever_the_status() {
+        for http_status in [200, 400] {
+            let template = ResponseTemplate::new(http_status).set_body_string(
+                r#"{"data":null,"errors":[{"message":"Unknown field \"foo\" on type \"Query\".","path":["foo"],"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]}"#,
+            );
 
-        let response = query_against(template).await.unwrap();
-        assert!(response.has_errors());
-        assert_eq!(
-            response.errors()[0].message(),
-            "Unknown field \"foo\" on type \"Query\"."
-        );
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            match query_against(template).await {
+                Err(Error::GraphQL { status, errors }) => {
+                    assert_eq!(status, http_status);
+                    assert_eq!(errors.len(), 1);
+                    assert_eq!(
+                        errors[0].message(),
+                        "Unknown field \"foo\" on type \"Query\"."
+                    );
+                    // The structured detail survives, which an opaque body string would flatten.
+                    assert_eq!(errors[0].code(), Some("GRAPHQL_VALIDATION_FAILED"));
+                    assert_eq!(
+                        errors[0].path().map(|p| p.len()),
+                        Some(1),
+                        "path lost for {http_status}"
+                    );
+                }
+                other => panic!("expected GraphQL error for {http_status}, got: {other:?}"),
+            }
+        }
+    }
+
+    // `data` present but with null fields inside is a real "not found", not a rejected query.
+    #[tokio::test]
+    async fn absent_field_under_present_data_stays_ok() {
+        let template =
+            ResponseTemplate::new(200).set_body_string(r#"{"data":{"chainIdentifier":null}}"#);
+
+        // `Chain` requires the field, so this surfaces as a decode error rather than a rejection —
+        // the point is that it never becomes Error::GraphQL.
+        match query_against(template).await {
+            Err(Error::Request(err)) => assert!(err.is_decode(), "err: {err}"),
+            other => panic!("expected a decode error, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -583,15 +626,28 @@ mod tests {
         }
     }
 
+    // A long body is reported whole. Truncating it would make a JSON error body unparsable, and
+    // would not save anything: the full body is already buffered by the time the error is built.
     #[tokio::test]
-    async fn oversized_body_is_truncated() {
+    async fn oversized_body_survives_whole() {
         let page = format!("<html>{}</html>", "unavailable ".repeat(200));
-        let template = ResponseTemplate::new(503).set_body_string(page);
+        let template = ResponseTemplate::new(503).set_body_string(page.clone());
 
         match query_against(template).await {
-            Err(Error::HttpStatus { body, .. }) => {
-                assert_eq!(body.chars().count(), BODY_SNIPPET_LIMIT + 1);
-                assert!(body.ends_with('…'), "body: {body}");
+            Err(Error::HttpStatus { body, .. }) => assert_eq!(body, page),
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    // A body that is not valid UTF-8 still reaches the caller rather than failing the decode.
+    #[tokio::test]
+    async fn invalid_utf8_body_is_reported_lossily() {
+        let template = ResponseTemplate::new(502).set_body_bytes(vec![0xff, 0xfe, b'o', b'k']);
+
+        match query_against(template).await {
+            Err(Error::HttpStatus { status, body }) => {
+                assert_eq!(status, 502);
+                assert!(body.ends_with("ok"), "body: {body}");
             }
             other => panic!("expected HttpStatus, got: {other:?}"),
         }

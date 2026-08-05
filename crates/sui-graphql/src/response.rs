@@ -6,10 +6,16 @@ use crate::error::GraphQLError;
 
 /// A GraphQL response containing data and/or errors.
 ///
-/// GraphQL responses can have three states:
+/// A `Response` covers every outcome except an outright rejection:
 /// - Success: `data` is present, `errors` is empty
 /// - Partial success: `data` is present AND `errors` is non-empty
-/// - Failure: `data` is None, `errors` is non-empty
+/// - Nothing said either way: no `data` and no `errors`, from a server that answered `{"data":
+///   null}` and left it at that
+///
+/// Total failure — no `data` and a non-empty `errors` list — is [`Error::GraphQL`] instead, so a
+/// rejected query cannot be mistaken for one that returned nothing.
+///
+/// [`Error::GraphQL`]: crate::Error::GraphQL
 #[derive(Debug)]
 pub struct Response<T> {
     status: StatusCode,

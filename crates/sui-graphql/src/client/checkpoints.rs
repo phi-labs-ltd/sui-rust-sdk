@@ -27,6 +27,8 @@ impl Client {
     /// Returns:
     /// - `Ok(Some(response))` if the checkpoint exists
     /// - `Ok(None)` if the checkpoint does not exist
+    /// - `Err(Error::GraphQL)` if the server rejected the query outright, so a rejection is never
+    ///   reported as `Ok(None)`. A field-level error returned alongside data is not a rejection.
     /// - `Err(Error::Request)` for network errors
     /// - `Err(Error::Base64)` / `Err(Error::Bcs)` for decoding errors
     pub async fn get_checkpoint(
