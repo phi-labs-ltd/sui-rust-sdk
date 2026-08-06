@@ -1,0 +1,39 @@
+name: Kellnr Publish
+
+# Releases this fork's `sui-graphql` to Phi Labs' registry. Upstream owns the crates.io release of
+# the same name, so nothing here ever targets crates.io — see `publish` in the crate's manifest.
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to publish to kellnr"
+        required: true
+        type: choice
+        options:
+          - sui-graphql
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: 📢 Publish ${{ inputs.package }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: rust version
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Authenticate with Kellnr registry
+        run: cargo login --registry kellnr "${{ secrets.CARGO_REGISTRIES_KELLNR_TOKEN }}"
+
+      - name: Build docs
+        run: cargo doc --package ${{ inputs.package }} --no-deps
+
+      - name: Publish
+        run: cargo publish --package ${{ inputs.package }} --registry kellnr

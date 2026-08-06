@@ -226,17 +226,13 @@ impl Client {
         let resp = req.send().await?;
         let status = resp.status();
 
-        // The status has to be read before the body is consumed as JSON. An intermediary reporting
-        // its own failure — a gateway's HTML page, a bare 502 — is not JSON at all, so decoding it
-        // fails with a `reqwest` error that carries no status, leaving the caller with "error
-        // decoding response body" and nothing to act on.
+        // An intermediary reporting its own failure — a gateway's HTML page, a bare 502 — is not
+        // JSON at all, so decoding it fails with a `reqwest` error that carries no status, leaving
+        // the caller with "error decoding response body" and nothing to act on.
         if !status.is_success() {
             let body = resp.bytes().await?;
             return Err(Error::HttpStatus {
                 status,
-                // Verbatim, and lossily decoded since an error page need not be valid UTF-8.
-                // Not truncated: the body is fully buffered before this error is built either
-                // way, and clipping it would only cost information.
                 body: String::from_utf8_lossy(&body).into_owned(),
             });
         }
