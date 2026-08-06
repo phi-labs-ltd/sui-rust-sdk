@@ -23,32 +23,12 @@ pub enum Error {
     #[error("HTTP status {status}: {body}")]
     HttpStatus {
         /// HTTP status of the response.
-        status: reqwest::StatusCode,
+        status: u16,
         /// The response body verbatim, so a caller can parse whatever the intermediary reported.
         /// Not truncated: the body is fully buffered before this error is built either way, and
         /// clipping it would only cost information — a JSON error body would stop being parsable.
         /// Lossily decoded, since an error page need not be valid UTF-8.
         body: String,
-    },
-
-    /// The server rejected the request and returned no data.
-    ///
-    /// GraphQL reports this as a non-empty `errors` list with `data` absent or null, and it is
-    /// independent of the HTTP status: a server may answer with `200` and
-    /// `application/json`, or with `400` and `application/graphql-response+json`. Both mean the
-    /// query never ran, so the distinction is not the caller's to make.
-    ///
-    /// Partial success — some `data` alongside `errors` — is not this error; it arrives as
-    /// [`Response`](crate::Response) so the caller can decide what the partial data is worth.
-    #[error(
-        "GraphQL request failed under HTTP {status}: {}",
-        join_messages(errors)
-    )]
-    GraphQL {
-        /// HTTP status the errors arrived under.
-        status: reqwest::StatusCode,
-        /// The errors reported by the server, never empty.
-        errors: Vec<GraphQLError>,
     },
 
     /// Failed to serialize data (e.g., BCS encoding).
@@ -62,15 +42,6 @@ pub enum Error {
     /// Missing expected data in response.
     #[error("Missing expected data: {0}")]
     MissingData(&'static str),
-}
-
-/// Renders every error message into one line, for [`Error::GraphQL`]'s `Display`.
-fn join_messages(errors: &[GraphQLError]) -> String {
-    errors
-        .iter()
-        .map(GraphQLError::message)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 impl From<base64ct::Error> for Error {
@@ -183,25 +154,6 @@ mod tests {
                 .unwrap_err(),
         );
         assert!(err.to_string().contains("Request error"));
-    }
-
-    #[test]
-    fn graphql_error_display_carries_status_and_every_message() {
-        let errors = ["first thing broke", "second thing broke"]
-            .into_iter()
-            .map(|message| serde_json::from_value(serde_json::json!({ "message": message })))
-            .collect::<Result<Vec<GraphQLError>, _>>()
-            .unwrap();
-
-        let err = Error::GraphQL {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            errors,
-        };
-
-        let rendered = err.to_string();
-        assert!(rendered.contains("400"), "{rendered}");
-        assert!(rendered.contains("first thing broke"), "{rendered}");
-        assert!(rendered.contains("second thing broke"), "{rendered}");
     }
 
     #[test]

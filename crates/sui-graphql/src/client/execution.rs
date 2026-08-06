@@ -28,9 +28,8 @@ impl Client {
     ///
     /// This commits the transaction to the blockchain and waits for finality.
     ///
-    /// Execution errors (e.g., invalid signatures, insufficient gas) arrive as
-    /// [`Error::GraphQL`], typically with code `BAD_USER_INPUT`. Inspect them via the variant's
-    /// `errors` field.
+    /// Execution errors (e.g., invalid signatures, insufficient gas) are returned as
+    /// GraphQL errors with code `BAD_USER_INPUT`, accessible via `Response::errors()`.
     ///
     /// # Arguments
     ///
@@ -40,8 +39,6 @@ impl Client {
     /// # Returns
     ///
     /// - `Ok(result)` with `effects` and `balance_changes` if successful
-    /// - `Err(Error::GraphQL)` if the node rejected the transaction outright, e.g. an invalid
-    ///   signature. Such a rejection never arrives as `Ok` with `effects: None`.
     /// - `Err(...)` for network or decoding errors
     pub async fn execute_transaction(
         &self,
@@ -200,19 +197,13 @@ mod tests {
         let transaction = test_transaction();
         let signature = test_signature();
 
-        // A rejected transaction must not read as "executed with no effects".
-        match client.execute_transaction(&transaction, &[signature]).await {
-            Err(Error::GraphQL { errors, .. }) => {
-                // `Error::GraphQL` is only built from a non-empty list, so an empty one here means
-                // that invariant broke — say so rather than panicking on an index.
-                let [error] = errors.as_slice() else {
-                    panic!("expected exactly one error, got {}", errors.len());
-                };
-                assert_eq!(error.message(), "Invalid argument: Invalid user signature");
-                assert_eq!(error.code(), Some("BAD_USER_INPUT"));
-            }
-            // REVIEW: Even though panics were real in this codebase I don't like them being here and would prefer error returned
-            other => panic!("expected the signature rejection to surface, got: {other:?}"),
-        }
+        let result = client
+            .execute_transaction(&transaction, &[signature])
+            .await
+            .unwrap();
+
+        // No data returned, effects should be None
+        assert!(result.effects.is_none());
+        assert!(result.balance_changes.is_empty());
     }
 }

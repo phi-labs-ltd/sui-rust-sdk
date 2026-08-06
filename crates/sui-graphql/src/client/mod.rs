@@ -24,36 +24,6 @@ use crate::response::Response;
 /// server's SDK-type allowlist to be tracked verbatim.
 const CLIENT_SDK_TYPE_HEADER: HeaderName = HeaderName::from_static("client-sdk-type");
 
-/// A response body in the shape the GraphQL spec defines.
-#[derive(Deserialize)]
-struct GraphQLResponse<T> {
-    data: Option<T>,
-    errors: Option<Vec<GraphQLError>>,
-}
-
-impl GraphQLResponse<serde_json::Value> {
-    /// Whether this body is the GraphQL server's own answer rather than an intermediary's error
-    /// report.
-    ///
-    /// Only a non-empty `data` object or a non-empty `errors` list qualifies. Deserializing
-    /// successfully proves nothing: `data` and `errors` are both optional, so a gateway's
-    /// `{"error":"UNAUTHORIZED"}` or a bare `{}` parses just as well as a real response, and would
-    /// otherwise pass for a query that legitimately returned nothing.
-    fn is_graphql(&self) -> bool {
-        let has_data = self
-            .data
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|data| !data.is_empty());
-
-        has_data
-            || self
-                .errors
-                .as_ref()
-                .is_some_and(|errors| !errors.is_empty())
-    }
-}
-
 /// GraphQL client for Sui blockchain.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -183,19 +153,14 @@ impl Client {
 
     /// Execute a GraphQL query and return the response.
     ///
-    /// The response contains both data and any errors (GraphQL supports partial success), and
-    /// carries the HTTP status it arrived under via [`Response::status`].
+    /// The response contains both data and any errors (GraphQL supports partial success).
     ///
     /// # Errors
     ///
-    /// - [`Error::GraphQL`] when the server reports errors and no data, whatever the HTTP status.
-    ///   The query never ran, so this is an error rather than an empty result.
-    /// - [`Error::HttpStatus`] when a non-success status carries a body that is not a GraphQL
-    ///   response at all — a gateway's HTML page, an unrelated JSON error, an empty body.
+    /// - [`Error::HttpStatus`] for a non-success HTTP status, carrying the status and the body
+    ///   verbatim. Nothing is parsed out of that body: the caller decides what, if anything, an
+    ///   intermediary's error page is worth.
     /// - [`Error::Request`] for network failures and for bodies that cannot be decoded.
-    ///
-    /// Partial success — data *and* errors — is `Ok`. The errors are on the [`Response`], and
-    /// [`Response::status`] carries the status they arrived under.
     ///
     /// # Example
     ///
@@ -216,10 +181,11 @@ impl Client {
     ///         .query::<MyResponse>("query { chainIdentifier }", serde_json::json!({}))
     ///         .await?;
     ///
-    ///     // A total failure would already have returned Err(Error::GraphQL). Errors here mean
-    ///     // some fields resolved and others did not.
-    ///     for err in response.errors() {
-    ///         eprintln!("partial error at {:?}: {}", err.path(), err.message());
+    ///     // Check for partial errors
+    ///     if response.has_errors() {
+    ///         for err in response.errors() {
+    ///             eprintln!("GraphQL error: {}", err.message());
+    ///         }
     ///     }
     ///
     ///     // Access the data
@@ -241,6 +207,12 @@ impl Client {
             variables: serde_json::Value,
         }
 
+        #[derive(Deserialize)]
+        struct GraphQLResponse<T> {
+            data: Option<T>,
+            errors: Option<Vec<GraphQLError>>,
+        }
+
         let request = GraphQLRequest { query, variables };
 
         let mut headers = self.headers.clone();
@@ -254,44 +226,23 @@ impl Client {
         let resp = req.send().await?;
         let status = resp.status();
 
-        let raw: GraphQLResponse<T> = if status.is_success() {
-            resp.json().await?
-        } else {
-            // A GraphQL server may still answer under a non-success status, so the body decides
-            // whether this is the server talking or something in front of it.
+        // The status has to be read before the body is consumed as JSON. An intermediary reporting
+        // its own failure — a gateway's HTML page, a bare 502 — is not JSON at all, so decoding it
+        // fails with a `reqwest` error that carries no status, leaving the caller with "error
+        // decoding response body" and nothing to act on.
+        if !status.is_success() {
             let body = resp.bytes().await?;
-            let candidate = serde_json::from_slice::<GraphQLResponse<serde_json::Value>>(&body)
-                .ok()
-                .filter(GraphQLResponse::is_graphql);
-
-            let Some(raw) = candidate else {
-                return Err(Error::HttpStatus {
-                    status,
-                    body: String::from_utf8_lossy(&body).into_owned(),
-                });
-            };
-
-            GraphQLResponse {
-                data: raw
-                    .data
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| {
-                        Error::Deserialization(format!("graphql data under HTTP {status}: {e}"))
-                    })?,
-                errors: raw.errors,
-            }
-        };
-
-        let errors = raw.errors.unwrap_or_default();
-
-        // No data and a reason why means the query never ran. The HTTP status does not decide
-        // this: a server may report it under `200` with `application/json` or under `400` with
-        // `application/graphql-response+json`, and both mean the same thing.
-        match raw.data {
-            None if !errors.is_empty() => Err(Error::GraphQL { status, errors }),
-            data => Ok(Response::new(status, data, errors)),
+            return Err(Error::HttpStatus {
+                status: status.as_u16(),
+                // Verbatim, and lossily decoded since an error page need not be valid UTF-8.
+                // Not truncated: the body is fully buffered before this error is built either
+                // way, and clipping it would only cost information.
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
         }
+
+        let raw: GraphQLResponse<T> = resp.json().await?;
+        Ok(Response::new(raw.data, raw.errors.unwrap_or_default()))
     }
 }
 
@@ -503,7 +454,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.data().unwrap().chain, "test");
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
     #[tokio::test]
@@ -542,71 +492,12 @@ mod tests {
         }
     }
 
-    // A rejected query is an error, not an empty result — and the status it arrived under does not
-    // change that. Both of these bodies say the same thing; only the server's content negotiation
-    // differs.
+    // Bodies that deserialize into an empty GraphQL response. Every generated response type has
+    // all-optional fields, so decoding these would yield `Ok` with no data — indistinguishable
+    // from a query that legitimately returned nothing. The status is checked first, so it cannot
+    // happen.
     #[tokio::test]
-    async fn rejected_query_is_an_error_whatever_the_status() {
-        for http_status in [200, 400] {
-            let template = ResponseTemplate::new(http_status).set_body_string(
-                r#"{"data":null,"errors":[{"message":"Unknown field \"foo\" on type \"Query\".","path":["foo"],"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]}"#,
-            );
-
-            match query_against(template).await {
-                Err(Error::GraphQL { status, errors }) => {
-                    assert_eq!(status, http_status);
-                    assert_eq!(errors.len(), 1);
-                    assert_eq!(
-                        errors[0].message(),
-                        "Unknown field \"foo\" on type \"Query\"."
-                    );
-                    // The structured detail survives, which an opaque body string would flatten.
-                    assert_eq!(errors[0].code(), Some("GRAPHQL_VALIDATION_FAILED"));
-                    assert_eq!(
-                        errors[0].path().map(|p| p.len()),
-                        Some(1),
-                        "path lost for {http_status}"
-                    );
-                }
-                other => panic!("expected GraphQL error for {http_status}, got: {other:?}"),
-            }
-        }
-    }
-
-    // `data` present but with null fields inside is a real "not found", not a rejected query.
-    #[tokio::test]
-    async fn absent_field_under_present_data_stays_ok() {
-        let template =
-            ResponseTemplate::new(200).set_body_string(r#"{"data":{"chainIdentifier":null}}"#);
-
-        // `Chain` requires the field, so this surfaces as a decode error rather than a rejection —
-        // the point is that it never becomes Error::GraphQL.
-        match query_against(template).await {
-            Err(Error::Request(err)) => assert!(err.is_decode(), "err: {err}"),
-            other => panic!("expected a decode error, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn partial_success_under_non_success_status_keeps_everything() {
-        let template = ResponseTemplate::new(500).set_body_string(
-            r#"{"data":{"chainIdentifier":"test"},"errors":[{"message":"resolver failed","extensions":{"code":"INTERNAL_ERROR"}}]}"#,
-        );
-
-        let response = query_against(template).await.unwrap();
-        assert_eq!(response.data().unwrap().chain, "test");
-        assert_eq!(response.errors()[0].message(), "resolver failed");
-        assert_eq!(response.errors()[0].code(), Some("INTERNAL_ERROR"));
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    // Shapes that deserialize but say nothing: every generated response type has all-optional
-    // fields, so without the shape check these pass for a query that returned no data.
-    #[tokio::test]
-    async fn json_without_graphql_content_reports_status() {
+    async fn empty_shaped_json_reports_status() {
         for body in [
             r#"{"data":"oops"}"#,
             r#"{"data":{}}"#,

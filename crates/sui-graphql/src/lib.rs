@@ -133,10 +133,6 @@ pub mod scalars;
 /// `reqwest` as a direct dependency.
 pub use reqwest::header;
 
-/// Re-export of [`reqwest::StatusCode`], named by [`Error::HttpStatus`] and
-/// [`Response::status`], so callers don't need a direct `reqwest` dependency.
-pub use reqwest::StatusCode;
-
 pub use bcs::Bcs;
 pub use bcs::BcsBytes;
 pub use client::Client;

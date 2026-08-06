@@ -1,42 +1,23 @@
 //! Response type for GraphQL queries.
 
-use reqwest::StatusCode;
-
 use crate::error::GraphQLError;
 
 /// A GraphQL response containing data and/or errors.
 ///
-/// A `Response` covers every outcome except an outright rejection:
+/// GraphQL responses can have three states:
 /// - Success: `data` is present, `errors` is empty
 /// - Partial success: `data` is present AND `errors` is non-empty
-/// - Nothing said either way: no `data` and no `errors`, from a server that answered `{"data":
-///   null}` and left it at that
-///
-/// Total failure — no `data` and a non-empty `errors` list — is [`Error::GraphQL`] instead, so a
-/// rejected query cannot be mistaken for one that returned nothing.
-///
-/// [`Error::GraphQL`]: crate::Error::GraphQL
+/// - Failure: `data` is None, `errors` is non-empty
 #[derive(Debug)]
 pub struct Response<T> {
-    status: StatusCode,
     data: Option<T>,
     errors: Vec<GraphQLError>,
 }
 
 impl<T> Response<T> {
     /// Create a new response with data and errors.
-    pub(crate) fn new(status: StatusCode, data: Option<T>, errors: Vec<GraphQLError>) -> Self {
-        Self {
-            status,
-            data,
-            errors,
-        }
-    }
-
-    /// HTTP status the response arrived under. Not always a success status: a server may report
-    /// query-level errors with a 4xx and still return a readable response.
-    pub fn status(&self) -> StatusCode {
-        self.status
+    pub(crate) fn new(data: Option<T>, errors: Vec<GraphQLError>) -> Self {
+        Self { data, errors }
     }
 
     /// The deserialized data from the response, if present.
@@ -74,17 +55,15 @@ mod tests {
 
     #[test]
     fn test_response_no_errors() {
-        let response: Response<String> =
-            Response::new(StatusCode::OK, Some("data".to_string()), vec![]);
+        let response: Response<String> = Response::new(Some("data".to_string()), vec![]);
         assert!(!response.has_errors());
         assert!(response.errors().is_empty());
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
     fn test_response_with_errors() {
         let response: Response<String> =
-            Response::new(StatusCode::OK, Some("data".to_string()), vec![make_error()]);
+            Response::new(Some("data".to_string()), vec![make_error()]);
         assert!(response.has_errors());
         assert_eq!(response.errors().len(), 1);
     }

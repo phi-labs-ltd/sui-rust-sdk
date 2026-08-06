@@ -1,23 +1,15 @@
 # Unreleased
 
 ## Added
-- `Error::HttpStatus`, carrying the status and the start of the response body
-  when an endpoint answers with a non-success status and a body that is not a
-  GraphQL response
-- `Response::status`, the HTTP status a response arrived under, so query-level
-  errors reported with a non-success status stay distinguishable from a query
-  that resolved to errors under a 200
-- re-exports `reqwest::StatusCode`, named by both of the above, so callers do
-  not need a direct reqwest dependency
+- `Error::HttpStatus`, carrying the HTTP status and the response body verbatim
 
 ## Changed
-- `Client::query` now inspects the HTTP status instead of decoding every
-  response as GraphQL data. A non-success status is treated as a GraphQL
-  response only when the body carries a non-empty `data` object or a non-empty
-  `errors` list; anything else returns `Error::HttpStatus` instead of a decode
-  error with the status discarded, or an `Ok` response with no data. The shape
-  is checked before deserializing into the caller's type, which would otherwise
-  accept any JSON, since generated response types have all-optional fields
+- `Client::query` now checks the HTTP status before decoding the body, and
+  returns `Error::HttpStatus` for a non-success status. Previously the body was
+  decoded as GraphQL data regardless: an intermediary's HTML or empty error page
+  became a `reqwest` decode error with the status discarded, and an unrelated
+  JSON error body became `Ok` with no data, indistinguishable from a query that
+  legitimately returned nothing
 
 # [0.3.1] - 2026-07-16
 
