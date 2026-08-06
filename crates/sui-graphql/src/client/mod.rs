@@ -155,6 +155,13 @@ impl Client {
     ///
     /// The response contains both data and any errors (GraphQL supports partial success).
     ///
+    /// # Errors
+    ///
+    /// - [`Error::HttpStatus`] for a non-success HTTP status, carrying the status and the body
+    ///   verbatim. Nothing is parsed out of that body: the caller decides what, if anything, an
+    ///   intermediary's error page is worth.
+    /// - [`Error::Request`] for network failures and for bodies that cannot be decoded.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -216,8 +223,25 @@ impl Client {
             .post(self.endpoint.clone())
             .json(&request)
             .headers(headers);
-        let raw: GraphQLResponse<T> = req.send().await?.json().await?;
+        let resp = req.send().await?;
+        let status = resp.status();
 
+        // The status has to be read before the body is consumed as JSON. An intermediary reporting
+        // its own failure — a gateway's HTML page, a bare 502 — is not JSON at all, so decoding it
+        // fails with a `reqwest` error that carries no status, leaving the caller with "error
+        // decoding response body" and nothing to act on.
+        if !status.is_success() {
+            let body = resp.bytes().await?;
+            return Err(Error::HttpStatus {
+                status,
+                // Verbatim, and lossily decoded since an error page need not be valid UTF-8.
+                // Not truncated: the body is fully buffered before this error is built either
+                // way, and clipping it would only cost information.
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let raw: GraphQLResponse<T> = resp.json().await?;
         Ok(Response::new(raw.data, raw.errors.unwrap_or_default()))
     }
 }
@@ -250,10 +274,24 @@ mod tests {
         serde_json::json!({"data": {"chainIdentifier": "test"}, "errors": null})
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     struct Chain {
         #[serde(rename = "chainIdentifier")]
-        _chain: String,
+        chain: String,
+    }
+
+    // Answer a single query with `template` and hand back whatever the client made of it.
+    async fn query_against(template: ResponseTemplate) -> Result<Response<Chain>, Error> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+
+        Client::new(&server.uri())
+            .unwrap()
+            .query("query { chainIdentifier }", serde_json::json!({}))
+            .await
     }
 
     #[tokio::test]
@@ -408,5 +446,112 @@ mod tests {
             .query("query { chainIdentifier }", serde_json::json!({}))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn success_returns_data() {
+        let response = query_against(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .await
+            .unwrap();
+        assert_eq!(response.data().unwrap().chain, "test");
+    }
+
+    #[tokio::test]
+    async fn gateway_html_reports_status() {
+        let template =
+            ResponseTemplate::new(503).set_body_string("<html>Service Unavailable</html>");
+
+        match query_against(template).await {
+            Err(Error::HttpStatus { status, body }) => {
+                assert_eq!(status, 503);
+                assert!(body.contains("Service Unavailable"), "body: {body}");
+            }
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_json_reports_status() {
+        let template = ResponseTemplate::new(401)
+            .set_body_string(r#"{"error":"UNAUTHORIZED","request-id":""}"#);
+
+        match query_against(template).await {
+            Err(Error::HttpStatus { status, body }) => {
+                assert_eq!(status, 401);
+                assert!(body.contains("UNAUTHORIZED"), "body: {body}");
+            }
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_reports_status() {
+        match query_against(ResponseTemplate::new(502).set_body_string("")).await {
+            Err(Error::HttpStatus { status, .. }) => assert_eq!(status, 502),
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    // Bodies that deserialize into an empty GraphQL response. Every generated response type has
+    // all-optional fields, so decoding these would yield `Ok` with no data — indistinguishable
+    // from a query that legitimately returned nothing. The status is checked first, so it cannot
+    // happen.
+    #[tokio::test]
+    async fn empty_shaped_json_reports_status() {
+        for body in [
+            r#"{"data":"oops"}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{},"message":"rate limited"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"data":null}"#,
+            "{}",
+        ] {
+            let template = ResponseTemplate::new(500).set_body_string(body);
+
+            match query_against(template).await {
+                Err(Error::HttpStatus { status, .. }) => {
+                    assert_eq!(status, 500, "body: {body}");
+                }
+                other => panic!("expected HttpStatus for {body}, got: {other:?}"),
+            }
+        }
+    }
+
+    // A long body is reported whole. Truncating it would make a JSON error body unparsable, and
+    // would not save anything: the full body is already buffered by the time the error is built.
+    #[tokio::test]
+    async fn oversized_body_survives_whole() {
+        let page = format!("<html>{}</html>", "unavailable ".repeat(200));
+        let template = ResponseTemplate::new(503).set_body_string(page.clone());
+
+        match query_against(template).await {
+            Err(Error::HttpStatus { body, .. }) => assert_eq!(body, page),
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    // A body that is not valid UTF-8 still reaches the caller rather than failing the decode.
+    #[tokio::test]
+    async fn invalid_utf8_body_is_reported_lossily() {
+        let template = ResponseTemplate::new(502).set_body_bytes(vec![0xff, 0xfe, b'o', b'k']);
+
+        match query_against(template).await {
+            Err(Error::HttpStatus { status, body }) => {
+                assert_eq!(status, 502);
+                assert!(body.ends_with("ok"), "body: {body}");
+            }
+            other => panic!("expected HttpStatus, got: {other:?}"),
+        }
+    }
+
+    // Success responses are decoded exactly as before, including how they fail.
+    #[tokio::test]
+    async fn success_with_undecodable_body_stays_a_decode_error() {
+        let template = ResponseTemplate::new(200).set_body_string("not json at all");
+
+        match query_against(template).await {
+            Err(Error::Request(err)) => assert!(err.is_decode(), "err: {err}"),
+            other => panic!("expected a decode error, got: {other:?}"),
+        }
     }
 }

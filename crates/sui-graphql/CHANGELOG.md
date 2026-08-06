@@ -1,3 +1,18 @@
+# Unreleased
+
+## Added
+- `Error::HttpStatus`, carrying the HTTP status and the response body verbatim
+- re-exports `reqwest::StatusCode`, named by the above, so callers do not need a
+  direct reqwest dependency
+
+## Changed
+- `Client::query` now checks the HTTP status before decoding the body, and
+  returns `Error::HttpStatus` for a non-success status. Previously the body was
+  decoded as GraphQL data regardless: an intermediary's HTML or empty error page
+  became a `reqwest` decode error with the status discarded, and an unrelated
+  JSON error body became `Ok` with no data, indistinguishable from a query that
+  legitimately returned nothing
+
 # [0.3.1] - 2026-07-16
 
 ## Added
