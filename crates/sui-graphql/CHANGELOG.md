@@ -2,6 +2,8 @@
 
 ## Added
 - `Error::HttpStatus`, carrying the HTTP status and the response body verbatim
+- re-exports `reqwest::StatusCode`, named by the above, so callers do not need a
+  direct reqwest dependency
 
 ## Changed
 - `Client::query` now checks the HTTP status before decoding the body, and

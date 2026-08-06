@@ -233,7 +233,7 @@ impl Client {
         if !status.is_success() {
             let body = resp.bytes().await?;
             return Err(Error::HttpStatus {
-                status: status.as_u16(),
+                status,
                 // Verbatim, and lossily decoded since an error page need not be valid UTF-8.
                 // Not truncated: the body is fully buffered before this error is built either
                 // way, and clipping it would only cost information.

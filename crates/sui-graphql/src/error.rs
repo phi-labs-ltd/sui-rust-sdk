@@ -23,7 +23,7 @@ pub enum Error {
     #[error("HTTP status {status}: {body}")]
     HttpStatus {
         /// HTTP status of the response.
-        status: u16,
+        status: reqwest::StatusCode,
         /// The response body verbatim, so a caller can parse whatever the intermediary reported.
         /// Not truncated: the body is fully buffered before this error is built either way, and
         /// clipping it would only cost information — a JSON error body would stop being parsable.
