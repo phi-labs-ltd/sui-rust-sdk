@@ -1,12 +1,16 @@
 [package]
 name = "sui-graphql"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Joey Pham <joey.pham@mystenlabs.com>"]
 repository = "https://github.com/mystenlabs/sui-rust-sdk/"
 license = "Apache-2.0"
 edition = "2024"
 description = "GraphQL client for Sui blockchain"
 readme = "README.md"
+# This fork releases to Phi Labs' registry only. crates.io carries upstream's `sui-graphql` under
+# the same name, so publishing there is never what we want — listing kellnr alone makes an
+# accidental `cargo publish` fail instead of shadowing upstream. Drop this key when upstreaming.
+publish = [ "kellnr" ]
 
 [package.metadata.docs.rs]
 all-features = true

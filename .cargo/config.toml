@@ -1,3 +1,11 @@
 # This is required to enable running wasm tests
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
+# Phi Labs' private registry, the only place this fork publishes to. Upstream releases the same
+# crate names on crates.io, so a fork build must name its source explicitly rather than resolve by
+# version alone. Inert until something depends on or publishes to it, so a checkout without a
+# kellnr token still builds.
+[registries.kellnr]
+credential-provider = ["cargo:token"]
+index = "sparse+https://kellnr.archway.io/api/v1/crates/"

@@ -1,4 +1,4 @@
-# Unreleased
+# [0.3.2] - 2026-08-06
 
 ## Added
 - `Error::HttpStatus`, carrying the HTTP status and the response body verbatim
